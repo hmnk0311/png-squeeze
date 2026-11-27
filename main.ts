@@ -2,7 +2,7 @@
 // ordering trials, per-row adaptive filters screened by real deflate size, and
 // the best zlib stream found for the winning filtered data.
 // Lossless by construction: every candidate is built from the exact pixels.
-import { deflateSync, inflateSync, constants } from 'node:zlib';
+import { createDeflate, deflateSync, inflateSync, constants } from 'node:zlib';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -276,9 +276,31 @@ function formsOf(rgba: Uint8Array): Form[] {
   return forms;
 }
 
+// One zlib stream whose deflate blocks are closed every `rows` image rows
+// (Z_BLOCK flush): fresh Huffman tables for each stretch of rows, while the
+// 32 KiB dictionary keeps flowing across the boundary. Deterministic: the
+// split points depend only on the row count, never on the clock.
+function deflateSegmented(data: Uint8Array, stridePlus: number, rows: number, strategy: number): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    const d = createDeflate({ level: 9, memLevel: 8, strategy });
+    const chunks: Buffer[] = [];
+    d.on('data', (c: Buffer) => chunks.push(c));
+    d.on('end', () => resolve(new Uint8Array(Buffer.concat(chunks))));
+    d.on('error', reject);
+    const seg = stridePlus * rows;
+    let at = 0;
+    while (at < data.length) {
+      const end = Math.min(data.length, at + seg);
+      if (end >= data.length) d.end(Buffer.from(data.subarray(at, end)));
+      else { d.write(Buffer.from(data.subarray(at, end))); d.flush(constants.Z_BLOCK, () => {}); }
+      at = end;
+    }
+  });
+}
+
 // ---------- Squeeze one image ----------
-function squeeze(rgba: Uint8Array, width: number, height: number): Uint8Array {
-  let best: { form: Form; zlib: Uint8Array; total: number } | null = null;
+async function squeeze(rgba: Uint8Array, width: number, height: number): Promise<Uint8Array> {
+  let best: { form: Form; zlib: Uint8Array; total: number; data: Uint8Array } | null = null;
   const choices: (number | string)[] = [0, 1, 2, 3, 4, 'minsum', 'entropy', 'pairs'];
   const polish = (form: Form, data: Uint8Array) => {
     const optsList: object[] = [
@@ -290,7 +312,7 @@ function squeeze(rgba: Uint8Array, width: number, height: number): Uint8Array {
     for (const opts of optsList) {
       const z = deflateSync(data, opts);
       const total = z.length + form.chunkBytes;
-      if (!best || total < best.total) best = { form, zlib: new Uint8Array(z), total };
+      if (!best || total < best.total) best = { form, zlib: new Uint8Array(z), total, data };
     }
   };
   let bruteForm: Form | null = null, bruteLen = Infinity;
@@ -312,11 +334,24 @@ function squeeze(rgba: Uint8Array, width: number, height: number): Uint8Array {
   // on RGB(A) rows they cost seconds and never won, so they are skipped there.
   if (bruteForm && bruteForm.bpp === 1) polish(bruteForm, bruteFiltered(bruteForm.samples, width, height, bruteForm.bpp));
   if (!best) throw new Error('no form');
+  // Segmented-block trials on the winning filtered data only.
+  const stridePlus = width * best.form.bpp + 1;
+  for (const [rows, strategy] of [
+    [120, constants.Z_DEFAULT_STRATEGY],
+    [60, constants.Z_DEFAULT_STRATEGY],
+    [30, constants.Z_DEFAULT_STRATEGY],
+    [60, constants.Z_FILTERED],
+    [30, constants.Z_FILTERED],
+  ] as [number, number][]) {
+    const z = await deflateSegmented(best.data, stridePlus, rows, strategy);
+    const total = z.length + best.form.chunkBytes;
+    if (total < best.total) best = { form: best.form, zlib: z, total, data: best.data };
+  }
   return pngOf(width, height, best.form.ct, best.form.plte, best.form.trns, best.zlib);
 }
 
 for (const id of readdirSync(I).sort()) {
   const { rgba, width, height } = decodeInput(new Uint8Array(readFileSync(join(I, id, 'image.png'))));
   mkdirSync(join(O, id), { recursive: true });
-  writeFileSync(join(O, id, 'image.png'), squeeze(rgba, width, height));
+  writeFileSync(join(O, id, 'image.png'), await squeeze(rgba, width, height));
 }
