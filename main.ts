@@ -110,6 +110,17 @@ function signedCost(row: Uint8Array): number {
   for (let i = 0; i < row.length; i++) { const v = row[i]; s += v < 128 ? v : 256 - v; }
   return s;
 }
+const PAIR_SEEN = new Uint32Array(65536);
+let pairStamp = 0;
+function pairsCost(row: Uint8Array): number {
+  pairStamp++;
+  let n = 0;
+  for (let i = 1; i < row.length; i++) {
+    const p = (row[i - 1] << 8) | row[i];
+    if (PAIR_SEEN[p] !== pairStamp) { PAIR_SEEN[p] = pairStamp; n++; }
+  }
+  return n;
+}
 function entropyCost(row: Uint8Array, counts: Uint32Array): number {
   counts.fill(0);
   for (let i = 0; i < row.length; i++) counts[row[i]]++;
@@ -135,11 +146,36 @@ function filtered(samples: Uint8Array, width: number, height: number, bpp: numbe
     let bestT = 0, bestC = Infinity;
     for (let t = 0; t < 5; t++) {
       filterRowInto(t, cur, prev, bpp, trials[t]);
-      const cost = choice === 'minsum' ? signedCost(trials[t]) : entropyCost(trials[t], counts);
+      const cost = choice === 'minsum' ? signedCost(trials[t]) : choice === 'pairs' ? pairsCost(trials[t]) : entropyCost(trials[t], counts);
       if (cost < bestC) { bestC = cost; bestT = t; }
     }
     raw[at] = bestT;
     raw.set(trials[bestT], at + 1);
+  }
+  return raw;
+}
+// Per-row brute force: each row's filter is the one whose bytes deflate smallest
+// against the 32 KiB of already-chosen filtered data before it (level 4 trials).
+function bruteFiltered(samples: Uint8Array, width: number, height: number, bpp: number): Uint8Array {
+  const stride = width * bpp;
+  const raw = new Uint8Array(height * (stride + 1));
+  const trial = new Uint8Array(stride + 1);
+  for (let y = 0; y < height; y++) {
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    const at = y * (stride + 1);
+    const before = raw.subarray(Math.max(0, at - 32768), at);
+    let bestT = 0, bestLen = Infinity;
+    for (let t = 0; t < 5; t++) {
+      trial[0] = t;
+      filterRowInto(t, cur, prev, bpp, trial.subarray(1));
+      const z = before.length === 0
+        ? deflateSync(trial, { level: 4, memLevel: 9 })
+        : deflateSync(trial, { level: 4, memLevel: 9, dictionary: Buffer.from(before) });
+      if (z.length < bestLen) { bestLen = z.length; bestT = t; }
+    }
+    raw[at] = bestT;
+    filterRowInto(bestT, cur, prev, bpp, raw.subarray(at + 1, at + 1 + stride));
   }
   return raw;
 }
@@ -243,26 +279,38 @@ function formsOf(rgba: Uint8Array): Form[] {
 // ---------- Squeeze one image ----------
 function squeeze(rgba: Uint8Array, width: number, height: number): Uint8Array {
   let best: { form: Form; zlib: Uint8Array; total: number } | null = null;
-  const choices: (number | string)[] = [0, 1, 2, 4, 'minsum', 'entropy'];
-  for (const form of formsOf(rgba)) {
-    // Screen every filter choice at level 6, keep the winner, then polish at level 9.
-    let winData: Uint8Array | null = null, winLen = Infinity;
-    for (const choice of choices) {
-      const data = filtered(form.samples, width, height, form.bpp, choice);
-      const z = deflateSync(data, { level: 6, memLevel: 8 });
-      if (z.length + form.chunkBytes < winLen) { winLen = z.length + form.chunkBytes; winData = data; }
-    }
-    if (!winData) continue;
-    for (const opts of [
+  const choices: (number | string)[] = [0, 1, 2, 3, 4, 'minsum', 'entropy', 'pairs'];
+  const polish = (form: Form, data: Uint8Array) => {
+    const optsList: object[] = [
       { level: 9, memLevel: 8 },
       { level: 9, memLevel: 9 },
       { level: 9, memLevel: 8, strategy: constants.Z_FILTERED },
-    ]) {
-      const z = deflateSync(winData, opts);
+    ];
+    if (form.bpp === 1) optsList.push({ level: 9, memLevel: 8, strategy: constants.Z_RLE });
+    for (const opts of optsList) {
+      const z = deflateSync(data, opts);
       const total = z.length + form.chunkBytes;
       if (!best || total < best.total) best = { form, zlib: new Uint8Array(z), total };
     }
+  };
+  let bruteForm: Form | null = null, bruteLen = Infinity;
+  for (const form of formsOf(rgba)) {
+    // Screen every filter choice at level 6, keep the best two, then polish at level 9.
+    const scored: { data: Uint8Array; len: number }[] = [];
+    for (const choice of choices) {
+      const data = filtered(form.samples, width, height, form.bpp, choice);
+      const z = deflateSync(data, { level: 6, memLevel: 8 });
+      scored.push({ data, len: z.length + form.chunkBytes });
+    }
+    scored.sort((a, b) => a.len - b.len);
+    if (scored[0].len < bruteLen) { bruteLen = scored[0].len; bruteForm = form; }
+    polish(form, scored[0].data);
+    if (scored[1] && scored[1].len < scored[0].len * 1.02) polish(form, scored[1].data);
   }
+  // One per-row brute-force pass on the screened best form, polished the same way.
+  // Brute trials only pay on 1-byte-per-pixel forms (palette / grey) in testing;
+  // on RGB(A) rows they cost seconds and never won, so they are skipped there.
+  if (bruteForm && bruteForm.bpp === 1) polish(bruteForm, bruteFiltered(bruteForm.samples, width, height, bruteForm.bpp));
   if (!best) throw new Error('no form');
   return pngOf(width, height, best.form.ct, best.form.plte, best.form.trns, best.zlib);
 }
